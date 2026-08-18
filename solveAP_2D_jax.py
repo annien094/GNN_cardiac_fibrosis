@@ -7,10 +7,9 @@
 # - Outputs saved every gathert steps
 #
 # Notes:
-# - Arrays include a 1-cell "ghost" border (size = ncells+2), matching your MATLAB code.
+# - Arrays include a 1-cell "ghost" border (size = ncells+2) for enforcing boundary conditions.
 # - Neumann (no-flux) BC enforced by copying ghost cells from adjacent interior.
-# - del2 scaling: MATLAB's del2 in 2D effectively returns ~ (Laplacian)/4, and you multiply by 4.
-#   Here we compute Laplacian directly, so diffusion term is D * Laplacian + Dx*Vx + Dy*Vy.
+# - diffusion term is D * Laplacian + Dx*Vx + Dy*Vy.
 #
 # Run:
 #   params = Params(...)
@@ -57,10 +56,7 @@ print("Default backend:", jax.default_backend())
 # 1. INSTALL JAX WITH GPU SUPPORT (on server with CUDA):
 #    pip install --upgrade "jax[cuda12]"  # For CUDA 12
 #    pip install --upgrade "jax[cuda11]"  # For CUDA 11
-#
-# 2. VERIFY GPU IS DETECTED:
-#    Run this file and check the output above shows "gpu" device
-#
+
 # 3. EXPECTED SPEEDUPS WITH GPU:
 #    - Simulation (simulate()): 5-20x faster depending on grid size
 #    - Phie calculation (calc_phie_jax): 10-50x faster with many electrodes
@@ -72,12 +68,7 @@ print("Default backend:", jax.default_backend())
 #    - Avoids Python loops in hot paths
 #    - All array operations use jnp (not np) in compiled functions
 #
-# 5. MONITORING GPU USAGE:
-#    - Use nvidia-smi to check GPU utilization
-#    - First run will be slow (compilation), subsequent runs fast
-#
 # 6. MEMORY CONSIDERATIONS:
-#    - GPU has limited memory vs CPU
 #    - For 100x100 grid, 100 electrodes, 1500 timesteps: ~few GB
 #    - If OOM, reduce: ncells, num electrodes, or batch simulations
 # =============================================================================
@@ -109,10 +100,12 @@ class Params:
     b0: float               # baseline b (scalar)
     a_field: Optional[np.ndarray] = None  # (X,X) including ghost; if None -> a0 everywhere
     b_field: Optional[np.ndarray] = None  # (X,X) including ghost; if None -> b0 everywhere
+    k_field: Optional[np.ndarray] = None  # (X,X) including ghost; if None -> params.k everywhere
     D_matrix: Optional[np.ndarray] = None # (X,X) including ghost; if None -> D_scalar everywhere
 
     # Stimulation
     stim_mask: Optional[np.ndarray] = None  # interior (ncells,ncells) boolean/0-1
+    stim_masks: Optional[np.ndarray] = None # interior (ncyc,ncells,ncells); if set, one mask per cycle
     stim_amp_scale: float = 0.1             # Ia = stim_amp_scale * stim_mask (your MATLAB uses 0.1*stimgeo)
     
     # Spiral wave generation (cross-field stimulation)
@@ -150,13 +143,31 @@ def _ensure_fields(params: Params) -> Dict[str, np.ndarray]:
         b = np.asarray(params.b_field, dtype=np.float32)
         assert b.shape == (X, X)
 
-    if params.stim_mask is None:
-        stim_interior = np.zeros((params.ncells, params.ncells), dtype=np.float32)
+    if params.k_field is None:
+        k = np.full((X, X), params.k, dtype=np.float32)
     else:
-        stim_interior = np.asarray(params.stim_mask, dtype=np.float32)
-        assert stim_interior.shape == (params.ncells, params.ncells)
+        k = np.asarray(params.k_field, dtype=np.float32)
+        assert k.shape == (X, X)
 
-    stim_full = _pad_with_ghost(stim_interior, ghost_value=0.0).astype(np.float32)
+    if params.stim_masks is not None:
+        stim_masks_interior = np.asarray(params.stim_masks, dtype=np.float32)
+        assert stim_masks_interior.shape == (params.ncyc, params.ncells, params.ncells)
+        stim_masks_full = np.pad(
+            stim_masks_interior,
+            pad_width=((0, 0), (1, 1), (1, 1)),
+            mode="constant",
+            constant_values=0.0,
+        ).astype(np.float32)
+        stim_full = stim_masks_full[0]
+    else:
+        if params.stim_mask is None:
+            stim_interior = np.zeros((params.ncells, params.ncells), dtype=np.float32)
+        else:
+            stim_interior = np.asarray(params.stim_mask, dtype=np.float32)
+            assert stim_interior.shape == (params.ncells, params.ncells)
+
+        stim_full = _pad_with_ghost(stim_interior, ghost_value=0.0).astype(np.float32)
+        stim_masks_full = np.repeat(stim_full[None, ...], params.ncyc, axis=0).astype(np.float32)
     
     # Cross-field stimulation for spiral wave
     if params.cross_stim_mask is None:
@@ -167,7 +178,15 @@ def _ensure_fields(params: Params) -> Dict[str, np.ndarray]:
     
     cross_stim_full = _pad_with_ghost(cross_stim_interior, ghost_value=0.0).astype(np.float32)
 
-    return {"D": D, "a": a, "b": b, "stim_full": stim_full, "cross_stim_full": cross_stim_full}
+    return {
+        "D": D,
+        "a": a,
+        "b": b,
+        "k": k,
+        "stim_full": stim_full,
+        "stim_masks_full": stim_masks_full,
+        "cross_stim_full": cross_stim_full,
+    }
 
 
 def _apply_neumann_bc(V: Array) -> Array:
@@ -253,8 +272,9 @@ def simulate(params: Params,
     # Host -> device constants
     a = jnp.asarray(fields["a"], dtype=dtype)
     b = jnp.asarray(fields["b"], dtype=dtype)
+    k = jnp.asarray(fields["k"], dtype=dtype)
     D = jnp.asarray(fields["D"], dtype=dtype)
-    stim_full = jnp.asarray(fields["stim_full"], dtype=dtype)
+    stim_masks_full = jnp.asarray(fields["stim_masks_full"], dtype=dtype)
     cross_stim_full = jnp.asarray(fields["cross_stim_full"], dtype=dtype)
 
     # Precompute grad(D) once (your D_matrix is static)
@@ -288,7 +308,6 @@ def simulate(params: Params,
     dt = params.dt
     h = params.h
 
-    k = params.k
     mu1 = params.mu1
     mu2 = params.mu2
     epsi = params.epsi
@@ -299,8 +318,8 @@ def simulate(params: Params,
     cross_stim_time = params.cross_stim_time
     cross_stim_duration = params.cross_stim_duration
 
-    # Ia = 0.1*stimgeo in MATLAB; here stim_full already includes ghost border
-    Ia = params.stim_amp_scale * stim_full
+    # Ia = 0.1*stimgeo in MATLAB; here each cycle can use a different mask.
+    Ia_masks = params.stim_amp_scale * stim_masks_full
     Ia_cross = params.stim_amp_scale * cross_stim_full
 
     def step_fn(carry, n):
@@ -314,8 +333,12 @@ def simulate(params: Params,
         # Cross-field stimulation for spiral wave (applied at specific time)
         cross_stim_on = (t >= cross_stim_time) & (t < (cross_stim_time + cross_stim_duration))
         
+        # Cycle-specific pacing mask: each cycle can use a different location.
+        cycle_idx = jnp.clip(kk, 0, ncyc - 1)
+        Ia_cycle = Ia_masks[cycle_idx]
+
         # Combine both stimulations
-        Istim_primary = jnp.where(stim_on, Ia, jnp.zeros_like(Ia))
+        Istim_primary = jnp.where(stim_on, Ia_cycle, jnp.zeros_like(Ia_cycle))
         Istim_cross = jnp.where(cross_stim_on, Ia_cross, jnp.zeros_like(Ia_cross))
         Istim = Istim_primary + Istim_cross
 
@@ -453,14 +476,7 @@ def make_D_with_rect_patches(ncells: int, D0: float, Dfac: float, npatches: int,
             patch_rows, patch_cols = np.meshgrid(I, J, indexing='ij')
             fiblocs.append(np.stack([patch_rows.ravel(), patch_cols.ravel()], axis=1).astype(np.int32))
             n += 1
-    
-    # visualise the patches generated
-    plt.imshow(occ, origin="lower", cmap="gray")
-    plt.title(f"Rectangular patches (n={npatches})")
-    plt.xlabel("Column index")
-    plt.ylabel("Row index")
-    plt.show()
-    
+
     return D, occ
 #%% 
 # -------------------------------------------------------------------------
@@ -635,12 +651,6 @@ def irregular_shape_generation(ncells: int, D0: float, Dfac: float, npatches: in
 
     if n < npatches:
         print(f"Warning: placed {n}/{npatches} patches. Consider reducing p/max_aspect or widening area range.")
-    # visualise the patches generated
-    plt.imshow(mask_all, origin="lower", cmap="gray")
-    plt.title(f"Irregular patches (n={n})")
-    plt.xlabel("Column index")
-    plt.ylabel("Row index")
-    plt.show()
 
     return D_matrix, fiblocs
 
@@ -689,6 +699,60 @@ def generate_random_stim_mask(
     return stim_mask, (centre_stim_x, centre_stim_y)
 
 
+def generate_random_stim_masks_for_cycles(
+    ncells: int,
+    ncyc: int,
+    stim_size: int = 10,
+    seed: Optional[int] = None,
+    forbidden_mask: Optional[np.ndarray] = None,
+    max_tries_per_cycle: int = 500,
+) -> Tuple[np.ndarray, list[tuple[int, int]]]:
+    """Generate one random stimulation mask per cycle with distinct, non-overlapping locations."""
+    if ncyc < 1:
+        raise ValueError(f"ncyc must be >= 1, got {ncyc}")
+
+    rng = np.random.default_rng(seed)
+    stim_masks = np.zeros((ncyc, ncells, ncells), dtype=np.float32)
+    stim_centers: list[tuple[int, int]] = []
+
+    if forbidden_mask is not None:
+        forbidden_mask = np.asarray(forbidden_mask, dtype=bool)
+        if forbidden_mask.shape != (ncells, ncells):
+            raise ValueError("forbidden_mask must have shape (ncells, ncells)")
+    else:
+        forbidden_mask = np.zeros((ncells, ncells), dtype=bool)
+
+    half_size = stim_size // 2
+    used_mask = np.zeros((ncells, ncells), dtype=bool)
+
+    for cyc in range(ncyc):
+        placed = False
+        for _ in range(max_tries_per_cycle):
+            cx = int(rng.integers(half_size, ncells - half_size))
+            cy = int(rng.integers(half_size, ncells - half_size))
+
+            row_slice = slice(cx - half_size, cx + half_size)
+            col_slice = slice(cy - half_size, cy + half_size)
+            if forbidden_mask[row_slice, col_slice].any():
+                continue
+            if used_mask[row_slice, col_slice].any():
+                continue
+
+            stim_masks[cyc, row_slice, col_slice] = 1.0
+            used_mask[row_slice, col_slice] = True
+            stim_centers.append((cx, cy))
+            placed = True
+            break
+
+        if not placed:
+            raise ValueError(
+                "Failed to place distinct stimulus masks for all cycles; "
+                "increase max_tries_per_cycle or reduce stim_size."
+            )
+
+    return stim_masks, stim_centers
+
+
 def generate_spiral_wave_stim_masks(ncells: int, 
                                     planar_width: int = 5,
                                     cross_width: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -735,17 +799,35 @@ def generate_spiral_wave_stim_masks(ncells: int,
     return stim_mask, cross_stim_mask
 
 
-def run_single_simulation(ncells: int, 
+def run_single_simulation(ncells: int,
                           patch_type: str,
                           npatches: int,
                           seed: int,
+                          mode: str = 'fibrosis',
                           D0: float = 0.1,
-                          Dfac: float = 0.2,
+                          Dfac_range: Tuple[float, float] = (0.2, 0.4),
+                          a_factor_range: Tuple[float, float] = (1.10, 3.00),
+                          b_factor_range: Tuple[float, float] = (0.80, 0.90),
+                          neg_a_value: float = -0.025,
+                          k_increase_range: Tuple[float, float] = (1.2, 2.0),
                           save_dir: Optional[str] = None,
                           return_data: bool = True) -> Dict:
     """
-    Run a single AP simulation with either 'irregular' or 'rectangular' fibrotic patches.
-    
+    Run a single AP simulation with either 'irregular' or 'rectangular' patches.
+
+    Modes:
+    ------
+    mode='fibrosis' (default):
+        Patches are fibrotic: D is reduced by Dfac, a is increased by a_factor,
+        b is decreased by b_factor. Uses npatches as given.
+    mode='heightened_excitability_neg_a'
+       | 'heightened_excitability_higher_k'
+       | 'heightened_excitability_both':
+        Patches are heightened-excitability regions: D is unchanged, and
+        inside the patch a is set to a fixed negative value (neg_a_value)
+        and/or k is increased (factor in k_increase_range). npatches is
+        forced to 1.
+
     Parameters:
     -----------
     ncells : int
@@ -753,64 +835,141 @@ def run_single_simulation(ncells: int,
     patch_type : str
         Either 'irregular' or 'rectangular'
     npatches : int
-        Number of fibrotic patches
+        Number of patches (ignored and forced to 1 for excitability modes)
     seed : int
         Random seed for reproducibility
+    mode : str
+        One of 'fibrosis', 'heightened_excitability_neg_a',
+        'heightened_excitability_higher_k', 'heightened_excitability_both'
     D0 : float
         Baseline diffusion coefficient
-    Dfac : float
-        Diffusion reduction factor for fibrotic regions (D_fib = D0 * Dfac)
+    Dfac_range : tuple[float, float]
+        Diffusion reduction factor range (fibrosis mode only).
+    a_factor_range : tuple[float, float]
+        Multiplicative increase of a inside fibrotic regions (fibrosis mode).
+    b_factor_range : tuple[float, float]
+        Multiplicative decrease of b inside fibrotic regions (fibrosis mode).
+    neg_a_value : float
+        Fixed (negative) value of a inside excitability patches, e.g. -0.025
+        (chosen in [-0.03, -0.02]).
+    k_increase_range : tuple[float, float]
+        Multiplicative increase of k inside excitability patches (factor in [1.2, 2.0]).
     save_dir : str, optional
         Directory to save results. If None, results are not saved to disk.
-    
+
     Returns:
     --------
     dict containing: Vsav, Wsav, t_sav, D_matrix, fiblocs, stim_center, params
     """
+    valid_modes = (
+        'fibrosis',
+        'heightened_excitability_neg_a',
+        'heightened_excitability_higher_k',
+        'heightened_excitability_both',
+    )
+    if mode not in valid_modes:
+        raise ValueError(f"mode must be one of {valid_modes}, got {mode!r}")
+
+    is_excitability = mode != 'fibrosis'
+    if is_excitability:
+        npatches = 1
+
     X = ncells + 2
-    
-    # Generate fibrotic patches
+    rng = np.random.default_rng(seed)
+
+    # Baseline cell parameters (also used to build the heterogeneous fields below).
+    a0 = 0.01
+    b0 = 0.15
+    k0 = 8.0
+
+    # Sample per-simulation patch parameters.
+    if is_excitability:
+        # No D modification for excitability patches: pass Dfac=1.0 so
+        # irregular_shape_generation leaves D_matrix == D0 inside the patch.
+        Dfac = 1.0
+        neg_a = mode in ('heightened_excitability_neg_a',
+                         'heightened_excitability_both')
+        higher_k = mode in ('heightened_excitability_higher_k',
+                            'heightened_excitability_both')
+        # Fixed negative a inside the patch. a_factor records the effective
+        # multiplier (a_patch = a0 * a_factor = neg_a_value) so downstream
+        # plumbing (saving / metadata) is unchanged.
+        a_factor = (neg_a_value / a0) if neg_a else 1.0
+        k_factor = (float(rng.uniform(k_increase_range[0], k_increase_range[1]))
+                    if higher_k else 1.0)
+        b_factor = 1.0
+    else:
+        Dfac = float(rng.uniform(Dfac_range[0], Dfac_range[1]))
+        a_factor = float(rng.uniform(a_factor_range[0], a_factor_range[1]))
+        b_factor = float(rng.uniform(b_factor_range[0], b_factor_range[1]))
+        k_factor = 1.0
+
+    # Generate patches
     if patch_type == 'irregular':
-        D_matrix, fiblocs = irregular_shape_generation(ncells, D0=D0, Dfac=Dfac, 
+        D_matrix, fiblocs = irregular_shape_generation(ncells, D0=D0, Dfac=Dfac,
                                                        npatches=npatches, seed=seed)
     elif patch_type == 'rectangular':
-        D_matrix, fiblocs = make_D_with_rect_patches(ncells, D0=D0, Dfac=Dfac, 
+        D_matrix, fiblocs = make_D_with_rect_patches(ncells, D0=D0, Dfac=Dfac,
                                                      npatches=npatches, seed=seed)
     else:
         raise ValueError(f"patch_type must be 'irregular' or 'rectangular', got {patch_type}")
-    
-    # Generate random stimulation location, avoiding fibrotic areas
-    fibrotic_mask = D_matrix[1:-1, 1:-1] < D0
-    stim_mask, stim_center = generate_random_stim_mask(
-        ncells, stim_size=10, seed=seed, forbidden_mask=fibrotic_mask
+
+    # Build a boolean patch mask in full-grid coordinates from fiblocs (works
+    # for both fibrosis and excitability modes; D_matrix < D0 fails when Dfac=1).
+    patch_mask_full = np.zeros((X, X), dtype=bool)
+    for patch_coords in fiblocs:
+        if len(patch_coords) > 0:
+            patch_mask_full[patch_coords[:, 0], patch_coords[:, 1]] = True
+    patch_mask_interior = patch_mask_full[1:-1, 1:-1]
+
+    # Stimulation: avoid the patch region (fibrotic or excitability).
+    ncyc = 3
+    stim_masks, stim_centers = generate_random_stim_masks_for_cycles(
+        ncells=ncells,
+        ncyc=ncyc,
+        stim_size=10,
+        seed=seed + 1000,
+        forbidden_mask=patch_mask_interior,
     )
-    
+
+    a_field = np.full((X, X), a0, dtype=np.float32)
+    b_field = np.full((X, X), b0, dtype=np.float32)
+    k_field = np.full((X, X), k0, dtype=np.float32)
+    a_field[patch_mask_full] = a0 * a_factor
+    b_field[patch_mask_full] = b0 * b_factor
+    k_field[patch_mask_full] = k0 * k_factor
+
     # Create parameters
     p = Params(
         dt=0.01,
         tend=50*3,
         BCL=50.0,
-        ncyc=3,
+        ncyc=ncyc,
         extra=0.0,
         stimdur=1.0,
         gathert=10,
         ncells=ncells,
         h=0.1,
-        k=8.0,
+        k=k0,
         mu1=0.2,
         mu2=0.3,
         epsi=0.002,
         D_scalar=D0,
-        a0=0.01,
-        b0=0.15,
+        a0=a0,
+        b0=b0,
+        a_field=a_field,
+        b_field=b_field,
+        k_field=k_field,
         D_matrix=D_matrix,
-        stim_mask=stim_mask,
+        stim_mask=stim_masks[0],
+        stim_masks=stim_masks,
         stim_amp_scale=0.1,
+        cross_stim_mask=None,
         cyclic=False,
     )
     
     # Run simulation
-    print(f"Running {patch_type} simulation {seed}...")
+    print(f"Running {patch_type} simulation {seed} (mode={mode})...")
     out = simulate(p)
     
     # Calculate phie (extracellular potential) using JAX
@@ -833,25 +992,30 @@ def run_single_simulation(ncells: int,
         "t_sav": out["t_sav"],
         "D_matrix": D_matrix,
         "fiblocs": fiblocs,
-        "stim_center": stim_center,
+        "stim_centers": stim_centers,
         "phie": phie,
         "elecpos": elecpos,
+        "Dfac": Dfac,
+        "a_factor": a_factor,
+        "b_factor": b_factor,
+        "k_factor": k_factor,
         "params": p,
         "patch_type": patch_type,
+        "mode": mode,
         "seed": seed
     }
-    
+
     # Optionally save to disk
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
-        filename = os.path.join(save_dir, f"sim_{patch_type}_{seed}.npz")
-        
+        filename = os.path.join(save_dir, f"sim_{patch_type}_{mode}_{seed}.npz")
+
         # Convert fiblocs to object array if it's a list (irregular patches)
         # fiblocs is a list of arrays, each (N_patch, 2) with [row, col] coordinates
         fiblocs_save = result["fiblocs"]
         if isinstance(fiblocs_save, list):
             fiblocs_save = np.array(fiblocs_save, dtype=object)
-        
+
         # savez_compressed: save several arrays into a single file in compressed .npz format.
         np.savez_compressed(
             filename,
@@ -862,12 +1026,16 @@ def run_single_simulation(ncells: int,
             fiblocs=fiblocs_save,           # object array of (N_patch, 2) arrays - each [row, col]
             phie=result["phie"],            # (E, T) - [electrode, time]
             elecpos=result["elecpos"],      # (E, 2) - [electrode, (x, y)]
-            stim_center=np.array(result["stim_center"]),  # (2,) - (row, col)
+            stim_centers=np.array(result["stim_centers"], dtype=np.int32),  # (ncyc,2) - (row, col) per cycle
             patch_type=patch_type,
+            mode=mode,
             seed=seed,
             ncells=ncells,
             D0=D0,
             Dfac=Dfac,
+            a_factor=a_factor,
+            b_factor=b_factor,
+            k_factor=k_factor,
             npatches=npatches
         )
         print(f"  Saved to {filename}")
@@ -876,10 +1044,14 @@ def run_single_simulation(ncells: int,
         # Return minimal metadata to avoid retaining large arrays in memory
         return {
             "patch_type": patch_type,
+            "mode": mode,
             "seed": seed,
             "ncells": ncells,
             "D0": D0,
             "Dfac": Dfac,
+            "a_factor": a_factor,
+            "b_factor": b_factor,
+            "k_factor": k_factor,
             "npatches": npatches,
             "save_dir": save_dir,
         }
@@ -1091,45 +1263,8 @@ def run_simulations_same_patches(ncells: int,
 # plt.plot(out["t_sav"], out["Vsav"][:,51, 51])
 # plt.xlabel("Time (TU)")
 #%% save video
-
-def save_VW_video(Vsav, Wsav, fiblocs, filename="aliev_panfilov.mp4",
-                  fps=10, vmin=0.0, vmax=1.0):
-    """
-    Save V and W fields as a side-by-side MP4 video.
-
-    Vsav, Wsav: (T, nx, ny)
-    """
-    T = Vsav.shape[0]
-
-    with imageio.get_writer(filename, fps=fps, codec="libx264") as writer:
-        for k in range(T):
-            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-
-            axes[0].imshow(Vsav[k], origin="lower",
-                           vmin=vmin, vmax=vmax, cmap="viridis")
-            axes[0].imshow(fiblocs, origin="lower", cmap="gray", alpha=0.3)  # overlay fibrotic patches
-            axes[0].set_title("V")
-            axes[0].axis("off")
-
-            axes[1].imshow(Wsav[k], origin="lower",
-                           vmin=vmin, vmax=vmax, cmap="viridis")
-            axes[1].imshow(fiblocs, origin="lower", cmap="gray", alpha=0.3)  # overlay fibrotic patches
-            axes[1].set_title("W")
-            axes[1].axis("off")
-            # add timing as shared title
-            fig.suptitle(f"Time = {k*0.01*10:.2f} TU or {k*0.01*10*12.9:.2f} ms")  # assuming dt=0.01 and gathert=10, 1 TU is 12.9ms
-            # add contours of fibrotic patches
-
-            fig.canvas.draw()
-            frame = np.asarray(fig.canvas.buffer_rgba())
-            frame = frame[:, :, :3]  # drop alpha channel
-            # ----------------------
-
-            writer.append_data(frame)
-            plt.close(fig)
-
 def save_VW_video_fast(Vsav, Wsav, fiblocs, filename="aliev_panfilov.mp4",
-                       fps=10, vmin=0.0, vmax=1.0, dt=0.01, gathert=10,
+                       fps=20, vmin=0.0, vmax=1.0, dt=0.01, gathert=10,
                        add_labels=True, add_time=True, separator_width=4,
                        upscale_factor=4):
     """
@@ -1148,7 +1283,7 @@ def save_VW_video_fast(Vsav, Wsav, fiblocs, filename="aliev_panfilov.mp4",
         Upscale frames by this factor for better text quality (e.g., 4 = 400x400 from 100x100)
     """
     T = Vsav.shape[0]
-    viridis = cm.get_cmap('viridis')
+    viridis = plt.get_cmap("viridis")
     
     # Normalize function
     def to_rgb(x, overlay_mask):
@@ -1168,71 +1303,68 @@ def save_VW_video_fast(Vsav, Wsav, fiblocs, filename="aliev_panfilov.mp4",
     try:
         font_large = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 14)
         font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 10)
-    except:
+    except Exception:
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
-    
-    with imageio.get_writer(filename, fps=fps, codec="libx264") as writer:
-        for k in range(T):
-            V_rgb = to_rgb(Vsav[k], overlay)
-            W_rgb = to_rgb(Wsav[k], overlay)
-            
-            # Upscale for better text quality
-            if upscale_factor > 1:
-                V_img = Image.fromarray(V_rgb).resize(
-                    (V_rgb.shape[1] * upscale_factor, V_rgb.shape[0] * upscale_factor),
-                    Image.LANCZOS
-                )
-                W_img = Image.fromarray(W_rgb).resize(
-                    (W_rgb.shape[1] * upscale_factor, W_rgb.shape[0] * upscale_factor),
-                    Image.LANCZOS
-                )
-                V_rgb = np.array(V_img)
-                W_rgb = np.array(W_img)
-            
-            # Create separator (white vertical bar)
-            if separator_width > 0:
-                sep = np.ones((V_rgb.shape[0], separator_width * upscale_factor, 3), dtype=np.uint8) * 255
-                frame = np.concatenate([V_rgb, sep, W_rgb], axis=1)
-            else:
-                frame = np.concatenate([V_rgb, W_rgb], axis=1)
-            
-            # Add labels using PIL (much faster than matplotlib)
-            if add_labels or add_time:
-                img = Image.fromarray(frame)
-                draw = ImageDraw.Draw(img)
-                
-                # Add "V" and "W" titles
-                if add_labels:
-                    v_x = V_rgb.shape[1] // 2 - 10
-                    w_x = V_rgb.shape[1] + separator_width * upscale_factor + W_rgb.shape[1] // 2 - 10
-                    draw.text((v_x, 5), "V", fill=(255, 255, 255), font=font_large)
-                    draw.text((w_x, 5), "W", fill=(255, 255, 255), font=font_large)
-                
-                # Add timestamp
-                if add_time:
-                    t_tu = k * dt * gathert
-                    t_ms = t_tu * 12.9
-                    time_str = f"Time = {t_tu:.2f} TU ({t_ms:.2f} ms)"
-                    draw.text((10, frame.shape[0] - 25), time_str, 
-                             fill=(255, 255, 255), font=font_small)
-                
-                frame = np.array(img)
-            
-            writer.append_data(frame)
-    
-    print(f"Video saved: {filename}")
 
-#%%
-# save_VW_video_fast(
-#     out["Vsav"],
-#     out["Wsav"],
-#     D_matrix < p.D_scalar,
-#     filename="test_AP_irregular_Dfac0.2.mp4",
-#     fps=10,
-#     vmin=0.0,
-#     vmax=1.0,
-# )
+    def build_frame(k: int) -> np.ndarray:
+        V_rgb = to_rgb(Vsav[k], overlay)
+        W_rgb = to_rgb(Wsav[k], overlay)
+
+        # Upscale for better text quality
+        if upscale_factor > 1:
+            V_img = Image.fromarray(V_rgb).resize(
+                (V_rgb.shape[1] * upscale_factor, V_rgb.shape[0] * upscale_factor),
+                Image.LANCZOS,
+            )
+            W_img = Image.fromarray(W_rgb).resize(
+                (W_rgb.shape[1] * upscale_factor, W_rgb.shape[0] * upscale_factor),
+                Image.LANCZOS,
+            )
+            V_rgb = np.array(V_img)
+            W_rgb = np.array(W_img)
+
+        # Create separator (white vertical bar)
+        if separator_width > 0:
+            sep = np.ones((V_rgb.shape[0], separator_width * upscale_factor, 3), dtype=np.uint8) * 255
+            frame = np.concatenate([V_rgb, sep, W_rgb], axis=1)
+        else:
+            frame = np.concatenate([V_rgb, W_rgb], axis=1)
+
+        # Add labels using PIL (much faster than matplotlib)
+        if add_labels or add_time:
+            img = Image.fromarray(frame)
+            draw = ImageDraw.Draw(img)
+
+            if add_labels:
+                v_x = V_rgb.shape[1] // 2 - 10
+                w_x = V_rgb.shape[1] + separator_width * upscale_factor + W_rgb.shape[1] // 2 - 10
+                draw.text((v_x, 5), "V", fill=(255, 255, 255), font=font_large)
+                draw.text((w_x, 5), "W", fill=(255, 255, 255), font=font_large)
+
+            if add_time:
+                t_tu = k * dt * gathert
+                t_ms = t_tu * 12.9
+                time_str = f"Time = {t_tu:.2f} TU ({t_ms:.2f} ms)"
+                draw.text((10, frame.shape[0] - 25), time_str, fill=(255, 255, 255), font=font_small)
+
+            frame = np.array(img)
+
+        return frame
+
+    # Prefer ffmpeg-backed mp4 writing; fallback to gif if ffmpeg/plugin support is unavailable.
+    try:
+        with imageio.get_writer(filename, format="FFMPEG", mode="I", fps=fps, codec="libx264") as writer:
+            for k in range(T):
+                writer.append_data(build_frame(k))
+        print(f"Video saved: {filename}")
+    except Exception as exc:
+        gif_filename = os.path.splitext(filename)[0] + ".gif"
+        print(f"MP4 writer unavailable ({exc}); falling back to GIF: {gif_filename}")
+        with imageio.get_writer(gif_filename, mode="I", duration=1.0 / max(fps, 1)) as writer:
+            for k in range(T):
+                writer.append_data(build_frame(k))
+        print(f"Video saved: {gif_filename}")
 # %% Calculate phie
 
 def make_electrodes_from_domain(X: int, Y: int, numelec_x: int, numelec_y: int):
@@ -1456,6 +1588,127 @@ def calc_phie_jax(
 
     return np.array(phie), elecpos
 
+
+def _trapz_weights(x: np.ndarray) -> np.ndarray:
+    dx = np.diff(x)
+    if dx.size == 0:
+        return np.zeros_like(x)
+    w = np.empty_like(x)
+    w[0] = dx[0] * 0.5
+    w[-1] = dx[-1] * 0.5
+    if x.size > 2:
+        w[1:-1] = 0.5 * (dx[:-1] + dx[1:])
+    return w
+
+
+def build_phie_matrix_dense(
+    D_matrix: np.ndarray,
+    h: float,
+    elecposX: np.ndarray,
+    elecposY: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build explicit dense matrix A such that phie = A @ V_flat.
+    Matches calc_phie_jax boundary handling and trapz weights.
+
+    V_flat is row-major flattening of (ncells, ncells).
+    Returns A (E, N) and elecpos (E, 2).
+    """
+    ncells = D_matrix.shape[0] - 2
+    if ncells <= 0:
+        raise ValueError("D_matrix must include a 1-cell ghost border.")
+
+    D_core = D_matrix[1:-1, 1:-1].astype(np.float32, copy=False)
+
+    Dx_full, Dy_full = _grad_central(jnp.asarray(D_matrix, dtype=jnp.float32), h)
+    Dx_core = np.array(Dx_full)[1:-1, 1:-1].astype(np.float32, copy=False)
+    Dy_core = np.array(Dy_full)[1:-1, 1:-1].astype(np.float32, copy=False)
+
+    # Match calc_phie_jax electrode nudging
+    ex = np.array(elecposX, dtype=np.float32, copy=True)
+    ey = np.array(elecposY, dtype=np.float32, copy=True)
+    ex[np.isclose(ex % 1.0, 0.0)] += 1e-4
+    ey[np.isclose(ey % 1.0, 0.0)] += 1e-4
+    elecpos = np.stack([ex, ey], axis=1)
+
+    x_coords = np.arange(0, ncells + 2, dtype=np.float32)
+    y_coords = np.arange(0, ncells + 2, dtype=np.float32)
+    x_phys = x_coords * h
+    y_phys = y_coords * h
+    x_core = x_coords[1:-1]
+    y_core = y_coords[1:-1]
+
+    w_x = _trapz_weights(x_phys[1:-1])
+    w_y = _trapz_weights(y_phys[1:-1])
+    w_xy = (w_x[:, None] * w_y[None, :]).astype(np.float32)
+
+    # 1D gradient matrix matching jnp.gradient with uniform spacing
+    G = np.zeros((ncells, ncells), dtype=np.float32)
+    for i in range(ncells):
+        if i == 0:
+            G[i, 0] = -1.0 / h
+            G[i, 1] = 1.0 / h
+        elif i == ncells - 1:
+            G[i, ncells - 2] = -1.0 / h
+            G[i, ncells - 1] = 1.0 / h
+        else:
+            G[i, i - 1] = -0.5 / h
+            G[i, i + 1] = 0.5 / h
+
+    L = G @ G
+
+    # Precompute nonzero stencils per row
+    G_rows = []
+    L_rows = []
+    for i in range(ncells):
+        g_idx = np.nonzero(G[i])[0]
+        l_idx = np.nonzero(L[i])[0]
+        G_rows.append((g_idx, G[i, g_idx]))
+        L_rows.append((l_idx, L[i, l_idx]))
+
+    # Distance weights per electrode
+    Xg, Yg = np.meshgrid(x_core, y_core, indexing="ij")
+    N = ncells * ncells
+    E = ex.shape[0]
+    W = np.zeros((E, N), dtype=np.float32)
+    for e in range(E):
+        distance = np.sqrt((Xg - ex[e]) ** 2 + (Yg - ey[e]) ** 2) * h
+        weights = w_xy / distance
+        W[e, :] = weights.ravel(order="C")
+
+    # Build A directly: A = -W @ K, without forming K explicitly.
+    A = np.zeros((E, N), dtype=np.float32)
+    for i in range(ncells):
+        lxi_idx, lxi_val = L_rows[i]
+        gxi_idx, gxi_val = G_rows[i]
+        for j in range(ncells):
+            p = i * ncells + j
+            w_vec = W[:, p]
+
+            d_ij = D_core[i, j]
+            dx_ij = Dx_core[i, j]
+            dy_ij = Dy_core[i, j]
+
+            # X-direction contributions (vary row index, same col)
+            for k, v in zip(lxi_idx, lxi_val):
+                q = k * ncells + j
+                A[:, q] -= w_vec * (d_ij * v)
+            for k, v in zip(gxi_idx, gxi_val):
+                q = k * ncells + j
+                A[:, q] -= w_vec * (dx_ij * v)
+
+            # Y-direction contributions (vary col index, same row)
+            lyj_idx, lyj_val = L_rows[j]
+            gyj_idx, gyj_val = G_rows[j]
+            for k, v in zip(lyj_idx, lyj_val):
+                q = i * ncells + k
+                A[:, q] -= w_vec * (d_ij * v)
+            for k, v in zip(gyj_idx, gyj_val):
+                q = i * ncells + k
+                A[:, q] -= w_vec * (dy_ij * v)
+
+    return A, elecpos
+
 # %%
 # =============================================================================
 # BATCH SIMULATION GENERATION
@@ -1467,12 +1720,13 @@ def generate_batch_simulations(n_simulations: int = 10,
                                ncells: int = 100,
                                npatches: int = 5,
                                D0: float = 0.1,
-                               Dfac: float = 0.2,
-                               save_dir: str = "simulation_batch",
+                               Dfac_range: Tuple[float, float] = (0.2, 0.4),
+                               a_factor_range: Tuple[float, float] = (1.0, 1.0),
+                               b_factor_range: Tuple[float, float] = (1.0, 1.0),
+                               save_dir: str = "AP_simulations_more_var",
                                start_seed: int = 0,
                                keep_results: bool = True,
-                               same_patches: bool = False,
-                               n_stim: int = 3) -> list:
+                               save_one_video: bool = True) -> list:
     """
     Generate multiple simulations with varying fibrotic patterns and pacing locations.
     
@@ -1486,8 +1740,6 @@ def generate_batch_simulations(n_simulations: int = 10,
         Number of fibrotic patches per simulation
     D0 : float
         Baseline diffusion coefficient
-    Dfac : float
-        Diffusion reduction factor for fibrotic regions
     save_dir : str
         Directory to save simulation results
     start_seed : int
@@ -1504,46 +1756,48 @@ def generate_batch_simulations(n_simulations: int = 10,
     print(f"  - All with irregular patches")
     print(f"  - Grid size: {ncells}x{ncells}")
     print(f"  - Patches per simulation: {npatches}")
-    print(f"  - D0={D0}, Dfac={Dfac}")
+    print(f"  - Fibrosis variability: Dfac~U{Dfac_range}, a_factor~U{a_factor_range}, b_factor~U{b_factor_range}")
     print(f"  - Results will be saved to: {save_dir}/")
-    if same_patches:
-        print(f"  - Same patches per seed with {n_stim} pacing locations")
+    print("  - 3 pacing locations per simulation (ncyc=3 in run_single_simulation)")
     print(f"{'='*70}\n")
-    
+
     # Generate irregular patch simulations
     for i in range(n_simulations):
         seed = start_seed + i
-        if same_patches:
-            print(f"\n[{i+1}/{n_simulations}] Irregular patch set (seed={seed})")
-            batch_results = run_simulations_same_patches(
-                ncells=ncells,
-                patch_type="irregular",
-                npatches=npatches,
-                patch_seed=seed,
-                n_stim=n_stim,
-                D0=D0,
-                Dfac=Dfac,
-                save_dir=save_dir,
-                return_data=keep_results,
+
+        print(f"\n[{i+1}/{n_simulations}] Irregular patch simulation (seed={seed})")
+        need_result = keep_results or (save_one_video and i == 0)
+        result = run_single_simulation(
+            ncells=ncells,
+            patch_type='irregular',
+            npatches=npatches,
+            seed=seed,
+            D0=D0,
+            Dfac_range=Dfac_range,
+            a_factor_range=a_factor_range,
+            b_factor_range=b_factor_range,
+            save_dir=save_dir,
+            return_data=need_result,
+        )
+
+        if save_one_video and i == 0 and need_result:
+            video_filename = os.path.join(save_dir, f"preview_irregular_{seed}.mp4")
+            save_VW_video_fast(
+                result["Vsav"],
+                result["Wsav"],
+                result["D_matrix"] < result["params"].D_scalar,
+                filename=video_filename,
+                fps=20,
+                vmin=0.0,
+                vmax=1.0,
+                dt=result["params"].dt,
+                gathert=result["params"].gathert,
             )
-            if keep_results:
-                results.extend(batch_results)
-            del batch_results
-        else:
-            print(f"\n[{i+1}/{n_simulations}] Irregular patch simulation (seed={seed})")
-            result = run_single_simulation(
-                ncells=ncells,
-                patch_type='irregular',
-                npatches=npatches,
-                seed=seed,
-                D0=D0,
-                Dfac=Dfac,
-                save_dir=save_dir,
-                return_data=keep_results
-            )
-            if keep_results:
-                results.append(result)
-            del result
+
+        if keep_results:
+            results.append(result)
+
+        del result
 
         # Proactively release memory between simulations
         gc.collect()
@@ -1557,58 +1811,337 @@ def generate_batch_simulations(n_simulations: int = 10,
     if keep_results:
         print(f"Total simulations: {len(results)}")
     else:
-        total = n_simulations * n_stim if same_patches else n_simulations
+        total = n_simulations
         print(f"Total simulations: {total}")
     print(f"Results saved to: {save_dir}/")
     print(f"{'='*70}\n")
-    
+
     return results
 
 
+def generate_heightened_excitability_batch(
+    n_simulations: int = 20,
+    variant: str = 'higher_k',
+    ncells: int = 100,
+    D0: float = 0.1,
+    save_dir: str = "AP_simulations_heightened_excitability",
+    start_seed: int = 0,
+    neg_a_value: float = -0.025,
+    k_increase_range: Tuple[float, float] = (1.2, 2.0),
+    keep_results: bool = False,
+    save_one_video: bool = True,
+) -> list:
+    """
+    Generate a batch of single-patch heightened-excitability simulations.
+
+    Parameters:
+    -----------
+    n_simulations : int
+        Number of simulations to generate.
+    variant : str
+        Which parameter(s) to perturb inside the patch:
+          'neg_a'    -> mode='heightened_excitability_neg_a'
+          'higher_k' -> mode='heightened_excitability_higher_k'
+          'both'     -> mode='heightened_excitability_both'
+    ncells, D0, start_seed : as in generate_batch_simulations.
+    neg_a_value : fixed negative a inside the patch (e.g. -0.025), passed
+        through to run_single_simulation.
+    k_increase_range : sampling range for k, passed through to
+        run_single_simulation.
+    keep_results : if False, only the first sim's arrays are retained (for
+        the preview video); the rest are dropped after the npz is written.
+    save_one_video : write a preview .mp4 for the first simulation.
+    """
+    variant_to_mode = {
+        'neg_a':    'heightened_excitability_neg_a',
+        'higher_k': 'heightened_excitability_higher_k',
+        'both':     'heightened_excitability_both',
+    }
+    if variant not in variant_to_mode:
+        raise ValueError(
+            f"variant must be one of {list(variant_to_mode)}, got {variant!r}"
+        )
+    mode = variant_to_mode[variant]
+
+    os.makedirs(save_dir, exist_ok=True)
+    results = []
+
+    print(f"\n{'='*70}")
+    print(f"GENERATING {n_simulations} HEIGHTENED-EXCITABILITY SIMULATIONS")
+    print(f"  - variant: {variant}  (mode={mode})")
+    print(f"  - Grid size: {ncells}x{ncells}, 1 irregular patch per sim, D unchanged")
+    if variant in ('neg_a', 'both'):
+        print(f"  - a (patch) = {neg_a_value} (fixed negative)")
+    if variant in ('higher_k', 'both'):
+        print(f"  - k_factor ~ U[{k_increase_range[0]}, {k_increase_range[1]}]")
+    print(f"  - Results -> {save_dir}/")
+    print(f"{'='*70}\n")
+
+    for i in range(n_simulations):
+        seed = start_seed + i
+        print(f"\n[{i+1}/{n_simulations}] seed={seed}")
+
+        need_result = keep_results or (save_one_video and i == 0)
+        result = run_single_simulation(
+            ncells=ncells,
+            patch_type='irregular',
+            npatches=1,
+            seed=seed,
+            mode=mode,
+            D0=D0,
+            neg_a_value=neg_a_value,
+            k_increase_range=k_increase_range,
+            save_dir=save_dir,
+            return_data=need_result,
+        )
+
+        if save_one_video and i == 0 and need_result:
+            # Overlay the excitability patch (D == D0 here, so derive mask from fiblocs).
+            X = ncells + 2
+            patch_overlay = np.zeros((X, X), dtype=bool)
+            for patch_coords in result["fiblocs"]:
+                if len(patch_coords) > 0:
+                    patch_overlay[patch_coords[:, 0], patch_coords[:, 1]] = True
+
+            video_filename = os.path.join(save_dir, f"preview_{variant}_{seed}.mp4")
+            save_VW_video_fast(
+                result["Vsav"],
+                result["Wsav"],
+                patch_overlay,
+                filename=video_filename,
+                fps=20,
+                vmin=0.0,
+                vmax=1.0,
+                dt=result["params"].dt,
+                gathert=result["params"].gathert,
+            )
+
+        if keep_results:
+            results.append(result)
+
+        del result
+        gc.collect()
+        try:
+            jax.clear_caches()
+        except Exception:
+            pass
+
+    print(f"\n{'='*70}")
+    print(f"BATCH GENERATION COMPLETE  ({variant})")
+    print(f"Total simulations: {n_simulations}")
+    print(f"Results saved to: {save_dir}/")
+    print(f"{'='*70}\n")
+
+    return results
+
+
+def generate_no_fibrosis_dataset(n_simulations: int = 5,
+                                 ncells: int = 100,
+                                 D0: float = 0.1,
+                                 save_dir: str = "Eikonal-PINNs data",
+                                 seed_start: int = 0,
+                                 stim_size: int = 10,
+                                 numelec_x: int = 10,
+                                 numelec_y: int = 10,
+                                 save_videos: bool = True) -> list:
+    """
+    Generate simulations with no fibrosis, one pacing cycle (ncyc=1),
+    and random stimulation locations. Saves Vsav and phie per simulation.
+
+    Outputs (.npz) include: Vsav, t_sav, phie, elecpos, stim_center, ncells, D0, seed.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    results = []
+
+    # Uniform diffusion (no fibrosis) and shared operator A
+    X = ncells + 2
+    D_matrix = np.full((X, X), D0, dtype=np.float32)
+    elecposX, elecposY = make_electrodes_from_domain(
+        X=ncells + 2, Y=ncells + 2, numelec_x=numelec_x, numelec_y=numelec_y
+    )
+    A, elecpos = build_phie_matrix_dense(
+        D_matrix=D_matrix,
+        h=0.1,
+        elecposX=np.array(elecposX),
+        elecposY=np.array(elecposY),
+    )
+
+    rows, cols = np.meshgrid(
+        np.arange(ncells, dtype=np.int32),
+        np.arange(ncells, dtype=np.int32),
+        indexing="ij",
+    )
+    Vpos = np.stack([rows.ravel(), cols.ravel()], axis=1)
+    Vpos_mm = Vpos.astype(np.float32) * 0.1
+    elecpos_mm = elecpos.astype(np.float32) * 0.1
+
+    A_path = os.path.join(save_dir, "phie_operator_A.npz")
+    np.savez_compressed(
+        A_path,
+        A=A,
+        elecpos=elecpos_mm,
+        Vpos=Vpos_mm,
+        ncells=ncells,
+        D0=D0,
+        h=0.1,
+    )
+    print(f"Saved operator A to {A_path}")
+
+    for i in range(n_simulations):
+        seed = seed_start + i
+        rng = np.random.default_rng(seed)
+
+        # One random stimulus, no forbidden regions
+        stim_mask, stim_center = generate_random_stim_mask(
+            ncells=ncells,
+            stim_size=stim_size,
+            seed=int(rng.integers(0, 2**31 - 1))
+        )
+
+        p = Params(
+            dt=0.01,
+            tend=50.0,
+            BCL=50.0,
+            ncyc=1,
+            extra=0.0,
+            stimdur=1.0,
+            gathert=10,
+            ncells=ncells,
+            h=0.1,
+            k=8.0,
+            mu1=0.2,
+            mu2=0.3,
+            epsi=0.002,
+            D_scalar=D0,
+            a0=0.01,
+            b0=0.15,
+            D_matrix=D_matrix,
+            stim_mask=stim_mask,
+            stim_amp_scale=0.1,
+            cyclic=False,
+        )
+
+        print(f"Running no-fibrosis simulation {i + 1}/{n_simulations} (seed={seed})...")
+        out = simulate(p)
+
+        print("  Calculating phie...")
+        phie, elecpos = calc_phie_jax(
+            h=p.h,
+            D_matrix=D_matrix,
+            elecposX=np.array(elecposX),
+            elecposY=np.array(elecposY),
+            Vsav=out["Vsav"],
+            vsav_layout="TXY",
+        )
+
+        Vsav_full = out["Vsav"]
+        Vsav_flat = Vsav_full.reshape(Vsav_full.shape[0], -1).T
+        t_sav_ms = out["t_sav"] * 12.9
+
+        if i == 0:
+            phie_from_A = A @ Vsav_flat
+            max_abs_err = float(np.max(np.abs(phie_from_A - phie)))
+            mean_abs_err = float(np.mean(np.abs(phie_from_A - phie)))
+            print(f"  A consistency check: max |A@V - phie| = {max_abs_err:.3e}, mean = {mean_abs_err:.3e}")
+
+        filename = os.path.join(save_dir, f"iso_2D_{seed}.npz")
+        np.savez_compressed(
+            filename,
+            Vsav=Vsav_flat,
+            Vpos=Vpos_mm,
+            t_sav=t_sav_ms,
+            phie=phie,
+            elecpos=elecpos_mm,
+            stim_center=np.array(stim_center, dtype=np.int32),
+            ncells=ncells,
+            D0=D0,
+            seed=seed,
+        )
+
+        if save_videos:
+            video_filename = os.path.join(save_dir, f"iso_2D_{seed}.mp4")
+            save_VW_video_fast(
+                out["Vsav"],
+                out["Wsav"],
+                np.zeros((ncells, ncells), dtype=bool),
+                filename=video_filename,
+                fps=10,
+                vmin=0.0,
+                vmax=1.0,
+                dt=p.dt,
+                gathert=p.gathert,
+            )
+
+        results.append(
+            {
+                "Vsav": Vsav_flat,
+                "Vpos": Vpos_mm,
+                "t_sav": t_sav_ms,
+                "phie": phie,
+                "elecpos": elecpos_mm,
+                "stim_center": stim_center,
+                "params": p,
+                "seed": seed,
+            }
+        )
+
+        del out
+        gc.collect()
+        try:
+            jax.clear_caches()
+        except Exception:
+            pass
+
+    return results
+#%%
+# results = generate_no_fibrosis_dataset(
+#     n_simulations=5,
+#     ncells=100,
+#     D0=0.1,
+#     save_dir="Eikonal-PINNs_data_phys_unit",
+#     seed_start=0,
+#     stim_size=10,
+#     numelec_x=10,
+#     numelec_y=10,
+#     save_videos=True,
+# )
+
 # Example usage: Uncomment to run batch simulation generation
 # =============================================================================
-results = generate_batch_simulations(
-    n_simulations=1000,
-    ncells=100,
-    npatches=3,
-    D0=0.1,
-    Dfac=0.2,
-    save_dir="AP_simulations_npatches3_nstim3",
-    start_seed=15127,
-    keep_results=False,
-    same_patches=True,
-    n_stim=3
-)
+# results = generate_batch_simulations(
+#     n_simulations=1000,
+#     ncells=100,
+#     npatches=1,
+#     D0=0.1,
+#     save_dir=os.path.join(os.environ["EPHEMERAL"], "AP_simulations_low_D_1patch"),
+#     start_seed=8000,
+#     keep_results=False,
+#     save_one_video=True,
+# )
 
-# Optional: Generate videos for each simulation
-# for i, result in enumerate(results):
-#     video_filename = f"AP_simulations_batch/video_{result['patch_type']}_{result['seed']}.mp4"
-#     save_VW_video_fast(
-#         result["Vsav"],
-#         result["Wsav"],
-#         result["D_matrix"] < result["params"].D_scalar,
-#         filename=video_filename,
-#         fps=10,
-#         vmin=0.0,
-#         vmax=1.0,
-#         dt=result["params"].dt,
-#         gathert=result["params"].gathert,
-#     )
-#     print(f"Video {i+1}/{len(results)} saved: {video_filename}")
+# higher k only
+# generate_heightened_excitability_batch(
+#     n_simulations=1, variant='higher_k', start_seed=0,
+#     save_dir="AP_simulations_higher_k",
+#     save_one_video=True,
+# )
 
-# # %%
-# data = np.load("AP_simulations_batch_400elec/sim_irregular_1009_400elec.npz", allow_pickle=True)
-# Vsav = data["Vsav"]
-# Wsav = data["Wsav"] 
-# phie = data["phie"]
-# D_matrix = data["D_matrix"]
-# plt.figure()
-# plt.plot(phie[5,:])
-# # plt.figure()
-# # plt.imshow(D_matrix < 0.1, origin="lower", cmap="gray")
-# # %%
-# fiblocs = data["fiblocs"]
-# print(fiblocs.shape)
+# negative a only
+# generate_heightened_excitability_batch(
+#     n_simulations=100, variant='neg_a', start_seed=6001,
+#     save_dir="AP_simulations_neg_a",
+#     save_one_video=True,
+# )
+
+# both perturbations
+# generate_heightened_excitability_batch(
+#     n_simulations=1, variant='both', start_seed=200,
+#     save_dir="AP_simulations_ka_both",
+#     save_one_video=True,
+# )
+
+
+
 # # %%
 # # calculate extra phie values from saved V values and save them as separate files
 # # read all files in AP_simulations_batch
