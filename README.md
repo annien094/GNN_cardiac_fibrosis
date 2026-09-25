@@ -48,7 +48,7 @@ Training the model:
 Pretrain the CNN encoder module with [`train_cnn_electrode.py`](train_cnn_electrode.py) ➡️ train the GNN module with [`train_gnn_with_pretrained_cnn.py`](train_gnn_with_pretrained_cnn.py)
 
   
-Finetuning/evaluating the model:
+Evaluating the model:
 - evaluate the performance of baseline CNN model by simply extrapolating the pretrained CNN's predictions to the tissue nodes: [`extrapolate_cnn_to_tm.py`](extrapolate_cnn_to_tm.py)
 - evaluate the proposed GNN model with [`evaluate_gnn.py`](evaluate_gnn.py)
 
