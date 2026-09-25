@@ -53,7 +53,7 @@ Evaluating the model:
 - evaluate the proposed GNN model with [`evaluate_gnn.py`](evaluate_gnn.py)
 
 ### 2D curved surfaces 
-All related code is in [`2d_curved_surf`](2d_curved_surf), where you can
+All related code is in [`2d_curved_surf/`](2d_curved_surf), where you can
 - generate 2D curved surfaces data with [`solveAP_surface_fenicsx_phie.py`](solveAP_surface_fenicsx_phie.py)
 - create graphs to be used for training with [`surface_to_graph.py`](surface_to_graph.py)
 - finetune pretrained models with [`surface_to_graph.py`](surface_to_graph.py)
